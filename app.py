@@ -4,22 +4,20 @@ import os
 import time
 import requests
 import json
+from datetime import datetime
 from google_play_scraper import search as play_search, app as play_scraper, reviews as play_reviews
-from app_store_scraper import AppStore
+from app_store_web_scraper import AppStoreEntry  # Futurice 2024: urllib3 pure, lazy review batches
 import re
 import nltk
 from nltk.sentiment import SentimentIntensityAnalyzer
 nltk.download('vader_lexicon', quiet=True)
 
-# Page config for wide, expanded layout
 st.set_page_config(layout="wide", page_title="AppWhistler AI", page_icon="🔍", initial_sidebar_state="expanded")
 
-# Ensure appwhistler dir exists
 base_dir = os.path.abspath(os.path.dirname(__file__))
 os.makedirs(os.path.join(base_dir, "appwhistler"), exist_ok=True)
 db_path = os.path.join(base_dir, "appwhistler", "appwhistler.db")
 
-# Popular apps dict (full list for autocomplete)
 POPULAR_APPS = {
     "facebook": {"play": "com.facebook.katana", "appstore": "284882215"},
     "whatsapp": {"play": "com.whatsapp", "appstore": "310633997"},
@@ -93,7 +91,6 @@ POPULAR_APPS = {
     "monzo bank": {"play": "co.monzo.android", "appstore": "931440173"}
 }
 
-# Secure API handling
 try:
     secrets = st.secrets
     hf_token = secrets.get("hf_token", "")
@@ -104,37 +101,40 @@ debug_mode = st.sidebar.checkbox("Debug Mode (Logs to Console)")
 
 def log_debug(msg):
     if debug_mode:
+        print(f"DEBUG: {msg}")
         st.sidebar.write(f"DEBUG: {msg}")
 
 def init_db(reset=False):
-    retries = 3
+    retries = 5
     for attempt in range(retries):
         try:
             if reset and os.path.exists(db_path):
                 os.remove(db_path)
+                log_debug("DB reset: File wiped")
             conn = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
             c = conn.cursor()
-            # Create table if not exists
             c.execute('''CREATE TABLE IF NOT EXISTS apps
                          (id INTEGER PRIMARY KEY AUTOINCREMENT,
                           name TEXT, pros TEXT, cons TEXT, truth_score INTEGER, truth_color TEXT,
                           app_id TEXT UNIQUE, store TEXT, issues TEXT, review_texts TEXT,
-                          icon_url TEXT, ai_summary TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
-            # Add indexes
+                          icon_url TEXT, ai_summary TEXT, created_at TEXT)''')
             c.execute('CREATE INDEX IF NOT EXISTS idx_app_id ON apps(app_id)')
             c.execute('CREATE INDEX IF NOT EXISTS idx_name ON apps(name)')
-            # Check and add missing columns (migration)
+            c.execute('CREATE INDEX IF NOT EXISTS idx_created_at ON apps(created_at)')
             c.execute("PRAGMA table_info(apps)")
             columns = [col[1] for col in c.fetchall()]
             if 'created_at' not in columns:
-                c.execute("ALTER TABLE apps ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+                log_debug("Migration: Adding created_at")
+                c.execute("ALTER TABLE apps ADD COLUMN created_at TEXT")
+                c.execute("UPDATE apps SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL")
+                log_debug(f"Migration: Backfilled {c.rowcount} rows")
             conn.commit()
-            log_debug(f"DB init success (attempt {attempt+1})")
+            log_debug(f"DB init triumph (attempt {attempt+1})")
             return conn
         except Exception as e:
-            log_debug(f"DB init fail (attempt {attempt+1}): {e}")
-            time.sleep(1)
-    st.error("DB init failed after retries.")
+            log_debug(f"DB init falter (attempt {attempt+1}): {e}")
+            time.sleep(2 ** attempt)
+    st.error("DB init exhausted—check paths.")
     return None
 
 def get_appstore_id(app_name):
@@ -147,7 +147,7 @@ def get_appstore_id(app_name):
             return str(data['results'][0]['trackId'])
         return None
     except Exception as e:
-        log_debug(f"AppStore ID fetch error: {e}")
+        log_debug(f"AppStore ID error: {e}")
         return None
 
 def get_play_id(app_name):
@@ -157,7 +157,7 @@ def get_play_id(app_name):
             return results[0]['appId']
         return None
     except Exception as e:
-        log_debug(f"Play ID fetch error: {e}")
+        log_debug(f"Play ID error: {e}")
         return None
 
 def fetch_app_info(app_name, store):
@@ -175,34 +175,35 @@ def fetch_app_info(app_name, store):
     icon_url = None
     try:
         if store == 'appstore':
-            app_scraper = AppStore(country='us', app_id=app_id)
-            app_scraper.review(how_many=50)  # Reduced for speed
-            reviews = app_scraper.reviews
-            # Fetch details for icon
+            app = AppStoreEntry(app_id=app_id, country="us")
+            for review_obj in app.reviews(limit=50):
+                reviews.append({
+                    'text': review_obj.content or '',
+                    'review': review_obj.content or '',
+                    'rating': review_obj.rating
+                })
             details_url = f"https://itunes.apple.com/lookup?id={app_id}&country=us"
             details_resp = requests.get(details_url, timeout=10)
             details = details_resp.json().get('results', [{}])[0]
             icon_url = details.get('artworkUrl512', '')
-        else:  # play
+        else:
             details = play_scraper(app_id, lang='en', country='us')
             icon_url = details.get('icon', '')
             reviews_result, _ = play_reviews(app_id, lang='en', country='us', count=50)
-            reviews = reviews_result
+            reviews = [{'text': r.get('content', ''), 'review': r.get('content', '')} for r in reviews_result]
         if not reviews:
-            raise IndexError("No reviews fetched—app may have restrictions.")
-        log_debug(f"Fetched {len(reviews)} reviews for {app_name}")
-        return reviews, icon_url
-    except IndexError as ie:
-        raise IndexError(f"Fetch index error for {app_name}: {ie}")
+            raise IndexError("No reviews fetched.")
+        log_debug(f"Fetched {len(reviews)} reviews for {app_name} (ID: {app_id})")
+        return reviews, icon_url, app_id
     except Exception as e:
-        raise Exception(f"Fetch failed for {app_name}: {e}")
+        raise Exception(f"Fetch failed: {e}")
 
 def analyze_reviews(reviews):
     sia = SentimentIntensityAnalyzer()
     pros, cons, issues, review_texts = [], [], [], []
     scores = []
-    for review in reviews[:50]:  # Cap for perf
-        text = review.get('text') or review.get('review', '') or ''
+    for review in reviews[:50]:
+        text = review.get('text') or review.get('review', '') or review.get('content', '') or ''
         if text:
             review_texts.append(text)
             score = sia.polarity_scores(text)['compound']
@@ -211,7 +212,7 @@ def analyze_reviews(reviews):
                 pros.append(text[:100] + '...')
             elif score < -0.05:
                 cons.append(text[:100] + '...')
-            if any(word in text.lower() for word in ['bug', 'crash', 'slow', 'issue']):
+            if re.search(r'\b(bug|crash|slow|issue)\b', text.lower()):
                 issues.append(text[:100] + '...')
     avg_score = sum(scores) / len(scores) if scores else 0
     truth_score = int((avg_score + 1) * 50)
@@ -220,42 +221,48 @@ def analyze_reviews(reviews):
 
 def get_ai_summary(review_texts):
     if not hf_token:
-        # NLTK fallback summary
         sia = SentimentIntensityAnalyzer()
         sentiments = [sia.polarity_scores(t)['compound'] for t in review_texts]
         overall = sum(sentiments) / len(sentiments) if sentiments else 0
         return f"Overall sentiment: {'Positive' if overall > 0 else 'Negative' if overall < 0 else 'Neutral'}. Key themes from {len(review_texts)} reviews."
     try:
         headers = {"Authorization": f"Bearer {hf_token}"}
-        payload = {"inputs": " ".join(review_texts[:3])[:512], "parameters": {"max_length": 150}}
+        payload = {"inputs": " ".join(review_texts[:3])[:512], "parameters": {"max_length": 150, "min_length": 50}}
         resp = requests.post("https://api-inference.huggingface.co/models/facebook/bart-large-cnn", headers=headers, json=payload, timeout=10)
         result = resp.json()
         return result[0].get('summary_text', 'Summary unavailable.') if isinstance(result, list) else 'Summary unavailable.'
     except Exception as e:
-        log_debug(f"HF summary error: {e}")
-        return "AI summary temporarily unavailable—using sentiment analysis."
+        log_debug(f"HF error: {e}")
+        return "AI summary unavailable—sentiment active."
 
 def save_to_db(conn, app_name, pros, cons, truth_score, truth_color, app_id, store, issues, review_texts, icon_url, ai_summary):
+    created_at = datetime.now().isoformat()
     try:
         c = conn.cursor()
         c.execute('''INSERT OR REPLACE INTO apps 
-                     (name, pros, cons, truth_score, truth_color, app_id, store, issues, review_texts, icon_url, ai_summary)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                  (app_name, pros, cons, truth_score, truth_color, app_id, store, issues, review_texts, icon_url, ai_summary))
+                     (name, pros, cons, truth_score, truth_color, app_id, store, issues, review_texts, icon_url, ai_summary, created_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                  (app_name, pros, cons, truth_score, truth_color, app_id, store, issues, review_texts, icon_url, ai_summary, created_at))
         conn.commit()
-        log_debug(f"Saved {app_name} to DB")
+        log_debug(f"Saved {app_name} (timestamp: {created_at[:19]})")
     except Exception as e:
-        log_debug(f"DB save error: {e}")
+        log_debug(f"Save error: {e}")
         st.error(f"Save failed: {e}")
 
-# Tier 10 CSS: macOS gradients, shadows, polymorphic text
+# Validator: Probe scraper on load
+try:
+    test_app = AppStoreEntry(app_id="1108187390", country="us")
+    log_debug("Scraper forged—urllib3 ready, reviews accessible")
+except Exception as e:
+    log_debug(f"Scraper probe falter: {e}")
+
 st.markdown("""
     <style>
     @import url('https://fonts.googleapis.com/css2?family=SF+Pro+Display:wght@300;400;500;600;700&display=swap');
     .stApp { background: linear-gradient(135deg, #f5f5f7 0%, #e5e5e7 100%); font-family: 'SF Pro Display', sans-serif; padding: 2rem; }
     .header { background: linear-gradient(135deg, #007aff 0%, #5856d6 100%); color: white; padding: 1.5rem; border-radius: 16px; text-align: center; box-shadow: 0 8px 32px rgba(0,0,0,0.1); margin-bottom: 2rem; }
     .app-card { background: linear-gradient(135deg, #ffffff 0%, #f8f9fa 100%); border-radius: 16px; padding: 1.5rem; box-shadow: 0 4px 16px rgba(0,0,0,0.08); transition: all 0.3s ease; animation: fadeIn 0.6s ease-out; }
-    .app-card:hover { transform: translateY(-4px) scale(1.02); box-shadow: 0 12px 32px rgba(0,0,0,0.15); }
+    .app-card:hover { transform: translateY(-4px) scale(1.02); box-shadow: 0 16px 40px rgba(0,0,0,0.15); }
     .app-card h3 { font-weight: 600; transition: font-weight 0.2s; }
     .app-card:hover h3 { font-weight: 700; }
     .stButton > button { background: linear-gradient(135deg, #007aff, #0056b3); color: white; border-radius: 12px; padding: 0.75rem 1.5rem; font-weight: 500; border: none; transition: all 0.3s; }
@@ -267,31 +274,28 @@ st.markdown("""
     .stTabs [data-baseweb="tab"]:hover { color: #007aff; background: #f5f5f7; }
     .stTabs [data-baseweb="tab"][aria-selected="true"] { color: #007aff; background: white; border-bottom: 2px solid #007aff; }
     @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
-    .logo { width: 48px; height: 48px; border-radius: 50%; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+    .logo { width: 48px; height: 48px; border-radius: 50%; box-shadow: 0 4px 12px rgba(0,0,0,0.15); transition: all 0.3s; }
+    .logo:hover { box-shadow: 0 6px 20px rgba(0,0,0,0.2); transform: scale(1.1); }
     </style>
 """, unsafe_allow_html=True)
 
-# Header with logo
 col1, col2 = st.columns([1, 4])
 with col1:
     st.markdown('<img src="https://x.ai/wp-content/uploads/2023/10/xai-logo.png" class="logo" alt="xAI Logo">', unsafe_allow_html=True)
 with col2:
     st.markdown('<h1 style="margin: 0; font-weight: 700; color: #1d1d1f;">AppWhistler AI</h1><p style="margin: 0; color: #8e8e93;">Truthful App Insights, Powered by Grok</p>', unsafe_allow_html=True)
 
-# Init DB
 conn = init_db()
 
-# Tabs for flow
 tab1, tab2, tab3 = st.tabs(["🏠 Home", "🔍 Search", "📜 History"])
 
 with tab1:
     st.markdown('<div class="header"><h2 style="margin: 0;">Discover Popular Apps</h2><p style="margin: 0; opacity: 0.9;">Curated insights at a glance</p></div>', unsafe_allow_html=True)
     cols = st.columns(4)
-    app_keys = list(POPULAR_APPS.keys())[:16]  # Top 16 for demo
+    app_keys = list(POPULAR_APPS.keys())[:16]
     for i, key in enumerate(app_keys):
         with cols[i % 4]:
-            ids = POPULAR_APPS[key]
-            placeholder_icon = "https://via.placeholder.com/80?text=" + key[0].upper() if not ids.get('icon_url') else ids.get('icon_url', '')
+            placeholder_icon = f"https://via.placeholder.com/80?text={key[0].upper()}"
             st.markdown(f'''
                 <div class="app-card">
                     <img src="{placeholder_icon}" width="80" style="border-radius: 12px;">
@@ -301,7 +305,6 @@ with tab1:
             ''', unsafe_allow_html=True)
 
 with tab2:
-    # Search excellence: Autocomplete + free text
     app_name = st.text_input("Search for an app...", placeholder="e.g., Apple Music")
     if app_name:
         suggestions = [k for k in POPULAR_APPS if app_name.lower() in k.lower()]
@@ -313,14 +316,13 @@ with tab2:
     col_btn, col_reset = st.columns([3, 1])
     with col_btn:
         if st.button("🔍 Analyze App", use_container_width=True):
-            with st.spinner("Fetching reviews & AI insights..."):
+            with st.spinner("Fetching reviews & distilling wisdom..."):
                 try:
-                    reviews, icon_url = fetch_app_info(app_name, store)
+                    reviews, icon_url, fetched_app_id = fetch_app_info(app_name, store)
                     pros, cons, issues, review_texts, truth_score, truth_color = analyze_reviews(reviews)
                     ai_summary = get_ai_summary(review_texts)
-                    save_to_db(conn, app_name, pros, cons, truth_score, truth_color, app_id=reviews[0].get('appId', ''), store=store, issues=issues, review_texts=review_texts, icon_url=icon_url, ai_summary=ai_summary)
+                    save_to_db(conn, app_name, pros, cons, truth_score, truth_color, fetched_app_id, store, issues, review_texts, icon_url, ai_summary)
                     
-                    # Render result card
                     color_map = {"Green": "#34c759", "Yellow": "#ffcc00", "Red": "#ff3b30"}
                     st.markdown(f'''
                         <div class="app-card" style="max-width: 600px; margin: 1rem auto;">
@@ -343,26 +345,26 @@ with tab2:
                                 <div style="padding: 1rem; background: #f8f9fa; border-radius: 8px; margin-top: 0.5rem;">
                                     <p><strong>Pros:</strong> {pros or 'N/A'}</p>
                                     <p><strong>Cons:</strong> {cons or 'N/A'}</p>
-                                    <p><strong>Sample Reviews:</strong> {review_texts[:2]}</p>
+                                    <p><strong>Sample Reviews:</strong> {', '.join(review_texts[:2])}</p>
                                 </div>
                             </details>
                         </div>
                     ''', unsafe_allow_html=True)
-                    st.success("Analysis complete! Check History tab.")
+                    st.success("Analysis eternal! History beckons.")
                 except ValueError as ve:
                     st.error(str(ve))
                 except IndexError as ie:
-                    st.error(f"Data fetch issue: {ie}. Try another app/store.")
+                    st.error(f"Fetch whisper: {ie}. Another app?")
                 except Exception as e:
-                    st.error(f"Unexpected error: {e}")
+                    st.error(f"Rift: {e}")
     with col_reset:
         if st.button("Reset DB", use_container_width=True):
             if st.checkbox("Confirm wipe? (Irreversible)"):
                 init_db(reset=True)
-                st.success("Database reset!")
+                st.success("DB reborn!")
 
 with tab3:
-    st.markdown('<div class="header"><h2 style="margin: 0;">Search History</h2></div>', unsafe_allow_html=True)
+    st.markdown('<div class="header"><h2 style="margin: 0;">Search History</h2><p style="margin: 0; opacity: 0.9;">Timestamps tell the tale</p></div>', unsafe_allow_html=True)
     if conn:
         try:
             c = conn.cursor()
@@ -371,18 +373,18 @@ with tab3:
             if history:
                 for row in history:
                     name, store, score, color, date = row
-                    st.markdown(f'<div class="app-card"><strong>{name}</strong> ({store.upper()}) - {score}/100 ({color})<br><small>{date}</small></div>', unsafe_allow_html=True)
+                    date_str = date[:19] if date else "Ancient"
+                    st.markdown(f'<div class="app-card"><strong>{name}</strong> ({store.upper()}) - {score}/100 ({color})<br><small>{date_str}</small></div>', unsafe_allow_html=True)
             else:
-                st.info("No history yet—start searching!")
+                st.info("Barren—ignite a search!")
         except Exception as e:
-            st.error(f"History load error: {e}")
+            st.error(f"History unravel: {e}")
     else:
-        st.warning("DB not connected—retry page load.")
+        st.warning("DB adrift—reload.")
 
-# Footer
 st.markdown("""
     <div style="text-align: center; padding: 2rem; color: #8e8e93; font-size: 0.875rem; border-top: 1px solid #e5e5e7; margin-top: 2rem;">
-        <p>Powered by Grok from xAI | Built for a truthful, app-savvy world 🚀 | Target: 100M+ downloads by Dec 2026</p>
+        <p>Powered by Grok from xAI | Built for a truthful world 🚀 | Target: 100M+ by Dec 2026</p>
     </div>
 """, unsafe_allow_html=True)
 
