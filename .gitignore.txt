@@ -1,4 +1,18 @@
+# Secrets sanctum – Hide API ether
 .streamlit/
+
+# DB veils – Local/ephemeral ghosts
 *.db
+
+# Python byte-code phantoms
 __pycache__/
+
+# Env var whispers
 .env
+
+# Virtual env shadows
+venv/
+env/
+
+# macOS bleed fidelity
+.DS_Store
